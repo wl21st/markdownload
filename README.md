@@ -20,6 +20,15 @@ The extension is available for [Firefox](https://addons.mozilla.org/en-GB/firefo
 
 [![iTunes App Store](https://img.shields.io/itunes/v/1554029832?label=Safari&logo=safari&style=flat)](https://apple.co/3tcU0pD)
 
+# Building
+
+From `src/`, run `npm install` once, then choose the package target:
+
+- `npm run build` builds the existing Firefox/Safari-compatible extension from `manifest.json`.
+- `npm run build:chrome` builds the separate Chrome Manifest V3 package at `web-ext-artifacts/chrome-mv3/markdownload-chrome-mv3.zip` (Chrome 109 or newer).
+
+The Chrome build stages the shared extension files and uses `manifest.chrome.json`; it does not replace the existing `manifest.json`.
+
 # Obsidian Integration
 
 For integration with obsidian, you need to install and enable community plugins named "Advanced Obsidian URI". This plugin help us to bypass character limitation in URL. Because it's using clipboard as the source for creating new file.

@@ -97,7 +97,7 @@ const showOrHideClipOption = selection => {
 }
 
 const clipSite = id => {
-    return browser.tabs.executeScript(id, { code: "getSelectionAndDom()" })
+    return executeFunctionInTab(id, () => getSelectionAndDom())
         .then((result) => {
             if (result && result[0]) {
                 showOrHideClipOption(result[0].selection);
@@ -157,13 +157,9 @@ browser.storage.sync.get(defaultOptions).then(options => {
 }).then((tabs) => {
     var id = tabs[0].id;
     var url = tabs[0].url;
-    browser.tabs.executeScript(id, {
-        file: "/browser-polyfill.min.js"
-    })
+    executeFileInTab(id, "/browser-polyfill.min.js")
     .then(() => {
-        return browser.tabs.executeScript(id, {
-            file: "/contentScript/contentScript.js"
-        });
+        return executeFileInTab(id, "/contentScript/contentScript.js");
     }).then( () => {
         console.info("Successfully injected MarkDownload content script");
         return clipSite(id);
@@ -239,4 +235,3 @@ function showError(err) {
     document.getElementById("spinner").style.display = 'none';
     cm.setValue(`Error clipping the page\n\n${err}`)
 }
-

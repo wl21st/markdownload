@@ -4,10 +4,78 @@ browser.runtime.getPlatformInfo().then(async platformInfo => {
   console.info(platformInfo, browserInfo);
 });
 
-// add notification listener for foreground page messages
-browser.runtime.onMessage.addListener(notify);
-// create context menus
-createMenus()
+const markDownloadOffscreen = globalThis.markDownloadOffscreen === true;
+const markDownloadIsMv3 = browser.runtime.getManifest().manifest_version >= 3;
+
+if (!markDownloadOffscreen) {
+  // add notification listener for foreground page messages
+  browser.runtime.onMessage.addListener(message => {
+    // Let the offscreen document answer its own RPC messages. Keep this a
+    // synchronous no-response path so the worker cannot win the response race.
+    if (message?.type?.startsWith("markdownload.offscreen.")) return;
+    return notify(message);
+  });
+
+  if (markDownloadIsMv3) {
+    browser.runtime.onInstalled.addListener(createMenus);
+    browser.runtime.onStartup.addListener(createMenus);
+  } else {
+    // create context menus
+    createMenus();
+  }
+
+  if (markDownloadIsMv3) browser.downloads.onChanged.addListener(releaseTrackedObjectUrl);
+}
+
+let markDownloadOffscreenCreation;
+
+async function ensureMarkDownloadOffscreen() {
+  if (!markDownloadIsMv3) return;
+
+  const offscreenUrl = chrome.runtime.getURL("offscreen.html");
+  let offscreenExists;
+  if (chrome.runtime.getContexts) {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [offscreenUrl]
+    });
+    offscreenExists = contexts.length > 0;
+  } else {
+    const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    offscreenExists = clients.some(client => client.url === offscreenUrl);
+  }
+
+  if (!offscreenExists) {
+    if (!markDownloadOffscreenCreation) {
+      markDownloadOffscreenCreation = chrome.offscreen.createDocument({
+        url: "offscreen.html",
+        reasons: ["DOM_PARSER", "BLOBS"],
+        justification: "Parse captured pages and prepare downloadable Markdown and image blobs."
+      }).finally(() => {
+        markDownloadOffscreenCreation = null;
+      });
+    }
+    await markDownloadOffscreenCreation;
+  }
+
+  // Wait for the offscreen message listener before sending work.
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      if (await browser.runtime.sendMessage({ type: "markdownload.offscreen.ping" })) return;
+    } catch { }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error("The MarkDownload offscreen document did not become ready.");
+}
+
+async function requestOffscreen(action, data) {
+  await ensureMarkDownloadOffscreen();
+  return browser.runtime.sendMessage({
+    type: "markdownload.offscreen.request",
+    action,
+    data
+  });
+}
 
 TurndownService.prototype.defaultEscape = TurndownService.prototype.escape;
 
@@ -317,10 +385,14 @@ function textReplace(string, article, disallowedChars = null) {
 }
 
 // function to convert an article info object into markdown
-async function convertArticleToMarkdown(article, downloadImages = null) {
-  const options = await getOptions();
+async function convertArticleToMarkdown(article, downloadImages = null, suppliedOptions = null) {
+  const options = suppliedOptions || await getOptions();
   if (downloadImages != null) {
     options.downloadImages = downloadImages;
+  }
+
+  if (markDownloadIsMv3 && !markDownloadOffscreen) {
+    return requestOffscreen("convertArticleToMarkdown", { article, downloadImages, options });
   }
 
   // substitute front and backmatter templates if necessary
@@ -338,9 +410,16 @@ async function convertArticleToMarkdown(article, downloadImages = null) {
   let result = turndown(article.content, options, article);
   if (options.downloadImages && options.downloadMode == 'downloadsApi') {
     // pre-download the images
-    result = await preDownloadImages(result.imageList, result.markdown);
+    result = await preDownloadImages(result.imageList, result.markdown, options);
   }
   return result;
+}
+
+async function convertHtmlToMarkdown(content, options, article) {
+  if (markDownloadIsMv3 && !markDownloadOffscreen) {
+    return requestOffscreen("turndown", { content, options, article });
+  }
+  return turndown(content, options, article);
 }
 
 // function to turn the title into a valid file name
@@ -366,8 +445,8 @@ function generateValidFileName(title, disallowedChars = null) {
   return name;
 }
 
-async function preDownloadImages(imageList, markdown) {
-  const options = await getOptions();
+async function preDownloadImages(imageList, markdown, suppliedOptions = null) {
+  const options = suppliedOptions || await getOptions();
   let newImageList = {};
   // originally, I was downloading the markdown file first, then all the images
   // however, in some cases we need to download images *first* so we can get the
@@ -435,13 +514,17 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
   
   // download via the downloads API
   if (options.downloadMode == 'downloadsApi' && browser.downloads) {
-    
-    // create the object url with markdown data as a blob
-    const url = URL.createObjectURL(new Blob([markdown], {
-      type: "text/markdown;charset=utf-8"
-    }));
-  
+    let url;
     try {
+      // create the object url with markdown data as a blob
+      url = markDownloadIsMv3
+        ? await requestOffscreen("createObjectUrl", {
+            data: markdown,
+            type: "text/markdown;charset=utf-8"
+          })
+        : URL.createObjectURL(new Blob([markdown], {
+            type: "text/markdown;charset=utf-8"
+          }));
 
       if(mdClipsFolder && !mdClipsFolder.endsWith('/')) mdClipsFolder += '/';
       // start the download
@@ -452,14 +535,14 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
       });
 
       // add a listener for the download completion
-      browser.downloads.onChanged.addListener(downloadListener(id, url));
+      await watchDownloadObjectUrl(id, url);
 
       // download images (if enabled)
       if (options.downloadImages) {
         // get the relative path of the markdown file (if any) for image path
         let destPath = mdClipsFolder + title.substring(0, title.lastIndexOf('/'));
         if(destPath && !destPath.endsWith('/')) destPath += '/';
-        Object.entries(imageList).forEach(async ([src, filename]) => {
+        await Promise.all(Object.entries(imageList).map(async ([src, filename]) => {
           // start the download of the image
           const imgId = await browser.downloads.download({
             url: src,
@@ -468,11 +551,14 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
             saveAs: false
           })
           // add a listener (so we can release the blob url)
-          browser.downloads.onChanged.addListener(downloadListener(imgId, src));
-        });
+          await watchDownloadObjectUrl(imgId, src);
+        }));
       }
     }
     catch (err) {
+      if (markDownloadIsMv3 && url) {
+        try { await requestOffscreen("revokeObjectUrl", { url }); } catch { }
+      }
       console.error("Download failed", err);
     }
   }
@@ -499,8 +585,11 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
     try {
       await ensureScripts(tabId);
       const filename = mdClipsFolder + generateValidFileName(title, options.disallowedChars) + ".md";
-      const code = `downloadMarkdown("${filename}","${base64EncodeUnicode(markdown)}");`
-      await browser.tabs.executeScript(tabId, {code: code});
+      await executeFunctionInTab(
+        tabId,
+        (name, data) => downloadMarkdown(name, data),
+        [filename, base64EncodeUnicode(markdown)]
+      );
     }
     catch (error) {
       // This could happen if the extension is not allowed to run code in
@@ -516,10 +605,31 @@ function downloadListener(id, url) {
       // detatch this listener
       browser.downloads.onChanged.removeListener(self);
       //release the url for the blob
-      URL.revokeObjectURL(url);
+      if (markDownloadIsMv3) requestOffscreen("revokeObjectUrl", { url });
+      else URL.revokeObjectURL(url);
     }
   }
   return self;
+}
+
+async function watchDownloadObjectUrl(id, url) {
+  if (markDownloadIsMv3) {
+    await browser.storage.local.set({ [`markdownload.download-url.${id}`]: url });
+  } else {
+    browser.downloads.onChanged.addListener(downloadListener(id, url));
+  }
+}
+
+async function releaseTrackedObjectUrl(delta) {
+  if (!delta.state || !["complete", "interrupted"].includes(delta.state.current)) return;
+
+  const key = `markdownload.download-url.${delta.id}`;
+  const stored = await browser.storage.local.get(key);
+  const url = stored[key];
+  if (!url) return;
+
+  await browser.storage.local.remove(key);
+  if (url.startsWith("blob:")) await requestOffscreen("revokeObjectUrl", { url });
 }
 
 function base64EncodeUnicode(str) {
@@ -534,7 +644,9 @@ function base64EncodeUnicode(str) {
 
 //function that handles messages from the injected script into the site
 async function notify(message) {
-  const options = await this.getOptions();
+  if (message?.type?.startsWith("markdownload.offscreen.")) return;
+
+  const options = await getOptions();
   // message for initial clipping of the dom
   if (message.type == "clip") {
     // get the article info from the passed in dom
@@ -560,69 +672,72 @@ async function notify(message) {
   }
   // message for triggering download
   else if (message.type == "download") {
-    downloadMarkdown(message.markdown, message.title, message.tab.id, message.imageList, message.mdClipsFolder);
+    await downloadMarkdown(message.markdown, message.title, message.tab.id, message.imageList, message.mdClipsFolder);
   }
 }
 
-browser.commands.onCommand.addListener(function (command) {
-  const tab = browser.tabs.getCurrent()
+if (!markDownloadOffscreen) {
+browser.commands.onCommand.addListener(async function (command) {
+  const [tab] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+  if (!tab) return;
   if (command == "download_tab_as_markdown") {
     const info = { menuItemId: "download-markdown-all" };
-    downloadMarkdownFromContext(info, tab);
+    await downloadMarkdownFromContext(info, tab);
   }
   else if (command == "copy_tab_as_markdown") {
     const info = { menuItemId: "copy-markdown-all" };
-    copyMarkdownFromContext(info, tab);
+    await copyMarkdownFromContext(info, tab);
   }
   else if (command == "copy_selection_as_markdown") {
     const info = { menuItemId: "copy-markdown-selection" };
-    copyMarkdownFromContext(info, tab);
+    await copyMarkdownFromContext(info, tab);
   }
   else if (command == "copy_tab_as_markdown_link") {
-    copyTabAsMarkdownLink(tab);
+    await copyTabAsMarkdownLink(tab);
   }
   else if (command == "copy_selected_tab_as_markdown_link") {
-    copySelectedTabAsMarkdownLink(tab);
+    await copySelectedTabAsMarkdownLink(tab);
   }
   else if (command == "copy_selection_to_obsidian") {
     const info = { menuItemId: "copy-markdown-obsidian" };
-    copyMarkdownFromContext(info, tab);
+    await copyMarkdownFromContext(info, tab);
   }
   else if (command == "copy_tab_to_obsidian") {
     const info = { menuItemId: "copy-markdown-obsall" };
-    copyMarkdownFromContext(info, tab);
+    await copyMarkdownFromContext(info, tab);
   }
 });
 
 // click handler for the context menus
-browser.contextMenus.onClicked.addListener(function (info, tab) {
+browser.contextMenus.onClicked.addListener(async function (info, tab) {
   // one of the copy to clipboard commands
   if (info.menuItemId.startsWith("copy-markdown")) {
-    copyMarkdownFromContext(info, tab);
+    await copyMarkdownFromContext(info, tab);
   }
   else if (info.menuItemId == "download-markdown-alltabs" || info.menuItemId == "tab-download-markdown-alltabs") {
-    downloadMarkdownForAllTabs(info);
+    await downloadMarkdownForAllTabs(info);
   }
   // one of the download commands
   else if (info.menuItemId.startsWith("download-markdown")) {
-    downloadMarkdownFromContext(info, tab);
+    await downloadMarkdownFromContext(info, tab);
   }
   // copy tab as markdown link
   else if (info.menuItemId.startsWith("copy-tab-as-markdown-link-all")) {
-    copyTabAsMarkdownLinkAll(tab);
+    await copyTabAsMarkdownLinkAll(tab);
   }
   // copy only selected tab as markdown link
   else if (info.menuItemId.startsWith("copy-tab-as-markdown-link-selected")) {
-    copySelectedTabAsMarkdownLink(tab);
+    await copySelectedTabAsMarkdownLink(tab);
   }
   else if (info.menuItemId.startsWith("copy-tab-as-markdown-link")) {
-    copyTabAsMarkdownLink(tab);
+    await copyTabAsMarkdownLink(tab);
   }
   // a settings toggle command
   else if (info.menuItemId.startsWith("toggle-") || info.menuItemId.startsWith("tabtoggle-")) {
-    toggleSetting(info.menuItemId.split('-')[1]);
+    await toggleSetting(info.menuItemId.split('-')[1]);
   }
 });
+}
 
 // this function toggles the specified option
 async function toggleSetting(setting, options = null) {
@@ -661,17 +776,21 @@ async function toggleSetting(setting, options = null) {
 
 // this function ensures the content script is loaded (and loads it if it isn't)
 async function ensureScripts(tabId) {
-  const results = await browser.tabs.executeScript(tabId, { code: "typeof getSelectionAndDom === 'function';" })
+  const results = await executeFunctionInTab(tabId, () => typeof getSelectionAndDom === 'function');
   // The content script's last expression will be true if the function
   // has been defined. If this is not the case, then we need to run
   // pageScraper.js to define function getSelectionAndDom.
   if (!results || results[0] !== true) {
-    await browser.tabs.executeScript(tabId, {file: "/contentScript/contentScript.js"});
+    await executeFileInTab(tabId, "/contentScript/contentScript.js");
   }
 }
 
 // get Readability article info from the dom passed in
 async function getArticleFromDom(domString) {
+  if (markDownloadIsMv3 && !markDownloadOffscreen) {
+    return requestOffscreen("getArticleFromDom", { domString });
+  }
+
   // parse the dom
   const parser = new DOMParser();
   const dom = parser.parseFromString(domString, "text/html");
@@ -683,8 +802,7 @@ async function getArticleFromDom(domString) {
   const math = {};
 
   const storeMathInfo = (el, mathInfo) => {
-    let randomId = URL.createObjectURL(new Blob([]));
-    randomId = randomId.substring(randomId.length - 36);
+    const randomId = `math-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     el.id = randomId;
     math[randomId] = mathInfo;
   };
@@ -800,7 +918,7 @@ async function getArticleFromDom(domString) {
 // `selection` is a bool indicating whether we should just get the selected text
 async function getArticleFromContent(tabId, selection = false) {
   // run the content script function to get the details
-  const results = await browser.tabs.executeScript(tabId, { code: "getSelectionAndDom()" });
+  const results = await executeFunctionInTab(tabId, () => getSelectionAndDom());
 
   // make sure we actually got a valid result
   if (results && results[0] && results[0].dom) {
@@ -871,7 +989,7 @@ async function copyTabAsMarkdownLink(tab) {
     await ensureScripts(tab.id);
     const article = await getArticleFromContent(tab.id);
     const title = await formatTitle(article);
-    await browser.tabs.executeScript(tab.id, { code: `copyToClipboard("[${title}](${article.baseURI})")` });
+    await executeFunctionInTab(tab.id, text => copyToClipboard(text), [`[${title}](${article.baseURI})`]);
     // await navigator.clipboard.writeText(`[${title}](${article.baseURI})`);
   }
   catch (error) {
@@ -900,7 +1018,7 @@ async function copyTabAsMarkdownLinkAll(tab) {
     };
     
     const markdown = links.join(`\n`)
-    await browser.tabs.executeScript(tab.id, { code: `copyToClipboard(${JSON.stringify(markdown)})` });
+    await executeFunctionInTab(tab.id, text => copyToClipboard(text), [markdown]);
 
   }
   catch (error) {
@@ -930,7 +1048,7 @@ async function copySelectedTabAsMarkdownLink(tab) {
     };
 
     const markdown = links.join(`\n`)
-    await browser.tabs.executeScript(tab.id, { code: `copyToClipboard(${JSON.stringify(markdown)})` });
+    await executeFunctionInTab(tab.id, text => copyToClipboard(text), [markdown]);
 
   }
   catch (error) {
@@ -945,9 +1063,9 @@ async function copyMarkdownFromContext(info, tab) {
   try{
     await ensureScripts(tab.id);
 
-    const platformOS = navigator.platform;
+    const platform = await browser.runtime.getPlatformInfo();
     var folderSeparator = "";
-    if(platformOS.indexOf("Win") === 0){
+    if(platform.os === "win"){
       folderSeparator = "\\";
     }else{
       folderSeparator = "/";
@@ -957,11 +1075,15 @@ async function copyMarkdownFromContext(info, tab) {
       const options = await getOptions();
       options.frontmatter = options.backmatter = '';
       const article = await getArticleFromContent(tab.id, false);
-      const { markdown } = turndown(`<a href="${info.linkUrl}">${info.linkText || info.selectionText}</a>`, { ...options, downloadImages: false }, article);
-      await browser.tabs.executeScript(tab.id, {code: `copyToClipboard(${JSON.stringify(markdown)})`});
+      const { markdown } = await convertHtmlToMarkdown(
+        `<a href="${info.linkUrl}">${info.linkText || info.selectionText}</a>`,
+        { ...options, downloadImages: false },
+        article
+      );
+      await executeFunctionInTab(tab.id, text => copyToClipboard(text), [markdown]);
     }
     else if (info.menuItemId == "copy-markdown-image") {
-      await browser.tabs.executeScript(tab.id, {code: `copyToClipboard("![](${info.srcUrl})")`});
+      await executeFunctionInTab(tab.id, text => copyToClipboard(text), [`![](${info.srcUrl})`]);
     }
     else if(info.menuItemId == "copy-markdown-obsidian") {
       const article = await getArticleFromContent(tab.id, info.menuItemId == "copy-markdown-obsidian");
@@ -970,7 +1092,7 @@ async function copyMarkdownFromContext(info, tab) {
       const obsidianVault = options.obsidianVault;
       const obsidianFolder = await formatObsidianFolder(article);
       const { markdown } = await convertArticleToMarkdown(article, downloadImages = false);
-      await browser.tabs.executeScript(tab.id, { code: `copyToClipboard(${JSON.stringify(markdown)})` });
+      await executeFunctionInTab(tab.id, text => copyToClipboard(text), [markdown]);
       await chrome.tabs.update({url: "obsidian://advanced-uri?vault=" + obsidianVault + "&clipboard=true&mode=new&filepath=" + obsidianFolder + generateValidFileName(title)});
     }
     else if(info.menuItemId == "copy-markdown-obsall") {
@@ -980,13 +1102,13 @@ async function copyMarkdownFromContext(info, tab) {
       const obsidianVault = options.obsidianVault;
       const obsidianFolder = await formatObsidianFolder(article);
       const { markdown } = await convertArticleToMarkdown(article, downloadImages = false);
-      await browser.tabs.executeScript(tab.id, { code: `copyToClipboard(${JSON.stringify(markdown)})` });
+      await executeFunctionInTab(tab.id, text => copyToClipboard(text), [markdown]);
       await browser.tabs.update({url: "obsidian://advanced-uri?vault=" + obsidianVault + "&clipboard=true&mode=new&filepath=" + obsidianFolder + generateValidFileName(title)});
     }
     else {
       const article = await getArticleFromContent(tab.id, info.menuItemId == "copy-markdown-selection");
       const { markdown } = await convertArticleToMarkdown(article, downloadImages = false);
-      await browser.tabs.executeScript(tab.id, { code: `copyToClipboard(${JSON.stringify(markdown)})` });
+      await executeFunctionInTab(tab.id, text => copyToClipboard(text), [markdown]);
     }
   }
   catch (error) {
@@ -1000,9 +1122,7 @@ async function downloadMarkdownForAllTabs(info) {
   const tabs = await browser.tabs.query({
     currentWindow: true
   });
-  tabs.forEach(tab => {
-    downloadMarkdownFromContext(info, tab);
-  });
+  await Promise.all(tabs.map(tab => downloadMarkdownFromContext(info, tab)));
 }
 
 /**
