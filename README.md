@@ -42,9 +42,12 @@ You need to do some configurations in order to use this integration.
 
 # External Libraries
 It uses the following libraries:
-- [Readability.js](https://github.com/mozilla/readability) by Mozilla version [0.5.0](https://github.com/mozilla/readability/releases/tag/0.5.0). This library is also used for the Firefox Reader View and it simplifies the page so that only the important parts are clipped. (Licensed under Apache License Version 2.0)
-- [Turndown](https://github.com/mixmark-io/turndown) by Dom Christie in version [7.1.3](https://github.com/mixmark-io/turndown/releases/tag/v7.1.3) is used to convert the simplified HTML (from Readability.js) into markdown. (Licensed under MIT License)
-- [Moment.js](https://momentjs.com) version 2.29.4 used to format dates in template variables
+- [Readability.js](https://github.com/mozilla/readability) by Mozilla version 0.6.0. This library is also used for the Firefox Reader View and it simplifies the page so that only the important parts are clipped. (Licensed under Apache License Version 2.0)
+- [Turndown](https://github.com/mixmark-io/turndown) by Dom Christie version 7.2.4 is used to convert the simplified HTML (from Readability.js) into markdown. (Licensed under MIT License)
+- [Turndown Plugin GFM](https://github.com/mixmark-io/turndown-plugin-gfm) version 1.0.2 adds GitHub Flavored Markdown support. (Licensed under MIT License)
+- [Moment.js](https://momentjs.com) version 2.31.0 is used to format dates in template variables.
+- [CodeMirror 5](https://codemirror.net/5/) version 5.65.20 provides the popup editor. (Licensed under MIT License)
+- [webextension-polyfill](https://github.com/mozilla/webextension-polyfill) version 0.12.0 provides Promise-based WebExtension APIs in Chrome. (Licensed under Mozilla Public License 2.0)
 
 # Permissions
 - Data on all sites: used to enable "Download All Tabs" functionality - no other data is captured or sent online

@@ -8,6 +8,12 @@
     "start:androidwin11": "adb connect 127.0.0.1:58526 && web-ext run -t firefox-android --adb-device 127.0.0.1:58526 --firefox-apk org.mozilla.fenix"
   },
   "devDependencies": {
-    "web-ext": "^7.4.0"
+    "@mozilla/readability": "^0.6.0",
+    "codemirror": "^5.65.20",
+    "moment": "^2.31.0",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2",
+    "web-ext": "^10.7.0",
+    "webextension-polyfill": "^0.12.0"
   }
 }
