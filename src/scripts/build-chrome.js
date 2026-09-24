@@ -36,6 +36,11 @@ try {
     "markdownload-chrome-mv3.zip",
     "--overwrite-dest"
   ], { stdio: "inherit" });
+
+  const unpackedDir = path.join(artifactsDir, "unpacked");
+  fs.rmSync(unpackedDir, { recursive: true, force: true });
+  fs.cpSync(stagingDir, unpackedDir, { recursive: true });
+  console.log(`Unpacked extension synchronized at: ${unpackedDir}`);
 } finally {
   fs.rmSync(stagingDir, { recursive: true, force: true });
 }

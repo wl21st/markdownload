@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MarkDownload - Markdown Web Clipper",
-  "version": "3.4.0",
+  "version": "3.4.3",
   "author": "Gordon Pedsersen",
   "description": "This extension works like a web clipper, but it downloads articles in markdown format.",
   "minimum_chrome_version": "109",
@@ -14,6 +14,7 @@
     "512": "icons/favicon-512x512.png"
   },
   "permissions": [
+    "tabs",
     "activeTab",
     "downloads",
     "storage",

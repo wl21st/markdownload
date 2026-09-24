@@ -1,11 +1,22 @@
-// log some info
-browser.runtime.getPlatformInfo().then(async platformInfo => {
-  const browserInfo = browser.runtime.getBrowserInfo ? await browser.runtime.getBrowserInfo() : "Can't get browser info"
-  console.info(platformInfo, browserInfo);
-});
+var markDownloadOffscreen = globalThis.markDownloadOffscreen === true;
+var markDownloadIsMv3 = globalThis.markDownloadIsMv3 ?? ((typeof getExtensionManifest === "function" ? getExtensionManifest() : (chrome?.runtime?.getManifest ? chrome.runtime.getManifest() : (browser?.runtime?.getManifest ? browser.runtime.getManifest() : {})))?.manifest_version >= 3);
+globalThis.markDownloadIsMv3 = markDownloadIsMv3;
 
-const markDownloadOffscreen = globalThis.markDownloadOffscreen === true;
-const markDownloadIsMv3 = browser.runtime.getManifest().manifest_version >= 3;
+// log some info in primary background context
+if (!markDownloadOffscreen) {
+  try {
+    if (typeof browser !== "undefined" && typeof browser.runtime?.getPlatformInfo === "function") {
+      browser.runtime.getPlatformInfo().then(async platformInfo => {
+        const browserInfo = browser.runtime?.getBrowserInfo ? await browser.runtime.getBrowserInfo() : "Can't get browser info";
+        console.info(platformInfo, browserInfo);
+      }).catch(() => {});
+    } else if (typeof chrome !== "undefined" && typeof chrome.runtime?.getPlatformInfo === "function") {
+      chrome.runtime.getPlatformInfo(platformInfo => {
+        console.info(platformInfo, "Chrome");
+      });
+    }
+  } catch {}
+}
 
 if (!markDownloadOffscreen) {
   // add notification listener for foreground page messages
@@ -33,14 +44,16 @@ async function ensureMarkDownloadOffscreen() {
   if (!markDownloadIsMv3) return;
 
   const offscreenUrl = chrome.runtime.getURL("offscreen.html");
-  let offscreenExists;
-  if (chrome.runtime.getContexts) {
+  let offscreenExists = false;
+  if (chrome.offscreen?.hasDocument) {
+    offscreenExists = await chrome.offscreen.hasDocument();
+  } else if (chrome.runtime.getContexts) {
     const contexts = await chrome.runtime.getContexts({
       contextTypes: ["OFFSCREEN_DOCUMENT"],
       documentUrls: [offscreenUrl]
     });
     offscreenExists = contexts.length > 0;
-  } else {
+  } else if (self.clients) {
     const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     offscreenExists = clients.some(client => client.url === offscreenUrl);
   }
@@ -51,6 +64,10 @@ async function ensureMarkDownloadOffscreen() {
         url: "offscreen.html",
         reasons: ["DOM_PARSER", "BLOBS"],
         justification: "Parse captured pages and prepare downloadable Markdown and image blobs."
+      }).catch(err => {
+        if (!err.message?.includes("Only a single offscreen")) {
+          throw err;
+        }
       }).finally(() => {
         markDownloadOffscreenCreation = null;
       });
@@ -649,26 +666,37 @@ async function notify(message) {
   const options = await getOptions();
   // message for initial clipping of the dom
   if (message.type == "clip") {
-    // get the article info from the passed in dom
-    const article = await getArticleFromDom(message.dom);
+    try {
+      // get the article info from the passed in dom
+      const article = await getArticleFromDom(message.dom);
+      if (!article) {
+        throw new Error("Could not extract article content from the page.");
+      }
 
-    // if selection info was passed in (and we're to clip the selection)
-    // replace the article content
-    if (message.selection && message.clipSelection) {
-      article.content = message.selection;
+      // if selection info was passed in (and we're to clip the selection)
+      // replace the article content
+      if (message.selection && message.clipSelection) {
+        article.content = message.selection;
+      }
+      
+      // convert the article to markdown
+      const { markdown, imageList } = await convertArticleToMarkdown(article);
+
+      // format the title
+      article.title = await formatTitle(article);
+
+      // format the mdClipsFolder
+      const mdClipsFolder = await formatMdClipsFolder(article);
+
+      // display the data in the popup
+      await browser.runtime.sendMessage({ type: "display.md", markdown: markdown, article: article, imageList: imageList, mdClipsFolder: mdClipsFolder});
+    } catch (err) {
+      console.error("Error processing clip in background:", err);
+      await browser.runtime.sendMessage({
+        type: "display.md.error",
+        error: err instanceof Error ? err.message : String(err)
+      });
     }
-    
-    // convert the article to markdown
-    const { markdown, imageList } = await convertArticleToMarkdown(article);
-
-    // format the title
-    article.title = await formatTitle(article);
-
-    // format the mdClipsFolder
-    const mdClipsFolder = await formatMdClipsFolder(article);
-
-    // display the data in the popup
-    await browser.runtime.sendMessage({ type: "display.md", markdown: markdown, article: article, imageList: imageList, mdClipsFolder: mdClipsFolder});
   }
   // message for triggering download
   else if (message.type == "download") {
@@ -875,22 +903,47 @@ async function getArticleFromDom(domString) {
   dom.documentElement.removeAttribute('class')
 
   // simplify the dom into an article
-  const article = new Readability(dom).parse();
+  let article = new Readability(dom).parse();
+  if (!article) {
+    article = {
+      title: dom.title || "Untitled",
+      byline: null,
+      dir: null,
+      lang: null,
+      content: dom.body ? dom.body.innerHTML : "",
+      textContent: dom.body ? (dom.body.innerText || dom.body.textContent || "") : "",
+      length: dom.body ? (dom.body.innerText || "").length : 0,
+      excerpt: "",
+      siteName: null,
+      publishedTime: null
+    };
+  }
 
   // get the base uri from the dom and attach it as important article info
-  article.baseURI = dom.baseURI;
+  article.baseURI = dom.baseURI || "";
   // also grab the page title
-  article.pageTitle = dom.title;
+  article.pageTitle = dom.title || article.title || "";
   // and some URL info
-  const url = new URL(dom.baseURI);
-  article.hash = url.hash;
-  article.host = url.host;
-  article.origin = url.origin;
-  article.hostname = url.hostname;
-  article.pathname = url.pathname;
-  article.port = url.port;
-  article.protocol = url.protocol;
-  article.search = url.search;
+  try {
+    const url = new URL(article.baseURI);
+    article.hash = url.hash;
+    article.host = url.host;
+    article.origin = url.origin;
+    article.hostname = url.hostname;
+    article.pathname = url.pathname;
+    article.port = url.port;
+    article.protocol = url.protocol;
+    article.search = url.search;
+  } catch {
+    article.hash = "";
+    article.host = "";
+    article.origin = "";
+    article.hostname = "";
+    article.pathname = "";
+    article.port = "";
+    article.protocol = "";
+    article.search = "";
+  }
   
 
   // make sure the dom has a head
@@ -1063,13 +1116,17 @@ async function copyMarkdownFromContext(info, tab) {
   try{
     await ensureScripts(tab.id);
 
-    const platform = await browser.runtime.getPlatformInfo();
-    var folderSeparator = "";
-    if(platform.os === "win"){
-      folderSeparator = "\\";
-    }else{
-      folderSeparator = "/";
-    }
+    let platformOs = "other";
+    try {
+      if (typeof browser !== "undefined" && typeof browser.runtime?.getPlatformInfo === "function") {
+        const platform = await browser.runtime.getPlatformInfo();
+        platformOs = platform.os;
+      } else if (typeof chrome !== "undefined" && typeof chrome.runtime?.getPlatformInfo === "function") {
+        const platform = await new Promise(r => chrome.runtime.getPlatformInfo(r));
+        platformOs = platform?.os || "other";
+      }
+    } catch {}
+    var folderSeparator = (platformOs === "win") ? "\\" : "/";
 
     if (info.menuItemId == "copy-markdown-link") {
       const options = await getOptions();

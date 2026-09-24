@@ -102,6 +102,8 @@ function getSelectionAndDom() {
         dom: getHTMLOfDocument()
     }
 }
+window.getSelectionAndDom = getSelectionAndDom;
+globalThis.getSelectionAndDom = getSelectionAndDom;
 
 // This function must be called in a visible page, such as a browserAction popup
 // or a content script. Calling it in a background page has no effect!
@@ -164,7 +166,13 @@ function downloadImage(filename, url) {
 }
 
 (function loadPageContextScript(){
-    var s = document.createElement('script');
-    s.src = browser.runtime.getURL('contentScript/pageContext.js');
-    (document.head||document.documentElement).appendChild(s);
+    try {
+        var s = document.createElement('script');
+        s.src = browser.runtime.getURL('contentScript/pageContext.js');
+        s.onload = function() { try { this.remove(); } catch(e){} };
+        (document.head||document.documentElement).appendChild(s);
+    } catch (e) {
+        // Silently ignore if page CSP restricts script injection
+    }
 })()
+

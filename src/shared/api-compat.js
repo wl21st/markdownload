@@ -1,6 +1,19 @@
-// Keep the existing tabs.executeScript API for MV2 browsers while using the
-// packaged-function form required by Chrome's Manifest V3 scripting API.
-const markDownloadApiIsMv3 = browser.runtime.getManifest().manifest_version >= 3;
+// Cross-browser helper to retrieve extension manifest safely across all contexts
+// (Service Worker, Offscreen document, Popup, Content Script, Firefox, Chrome).
+function getExtensionManifest() {
+  if (typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.getManifest === "function") {
+    return chrome.runtime.getManifest();
+  }
+  if (typeof browser !== "undefined" && browser.runtime && typeof browser.runtime.getManifest === "function") {
+    return browser.runtime.getManifest();
+  }
+  return { manifest_version: 2, version: "3.4.3" };
+}
+
+var markDownloadIsMv3 = (getExtensionManifest()?.manifest_version || 2) >= 3;
+var markDownloadApiIsMv3 = markDownloadIsMv3;
+globalThis.markDownloadIsMv3 = markDownloadIsMv3;
+globalThis.markDownloadApiIsMv3 = markDownloadIsMv3;
 
 async function executeFunctionInTab(tabId, func, args = []) {
   if (markDownloadApiIsMv3) {
